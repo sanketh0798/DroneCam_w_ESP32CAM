@@ -1,0 +1,437 @@
+/* Edge Impulse Arduino examples
+ * Copyright (c) 2022 EdgeImpulse Inc.
+ *
+ * This file is a combination of the Edge Impulse inferencing example
+ * and the standard Arduino ESP32 CameraWebServer example.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+// These sketches are tested with 2.0.4 ESP32 Arduino Core
+// https://github.com/espressif/arduino-esp32/releases/tag/2.0.4
+
+/* Includes ---------------------------------------------------------------- */
+// Edge Impulse
+#include <Prasadh-project-1_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ESP32 Camera and Web Server
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/rtc_io.h"
+#include <WebServer.h>
+
+// Replace with your network credentials
+const char *ssid = "ACT-B631";
+const char *password = "qwertyuiop";
+
+WebServer server(80);
+
+// Select camera model - AI THINKER
+#define CAMERA_MODEL_AI_THINKER
+
+#if defined(CAMERA_MODEL_AI_THINKER)
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+// <<< I2C pins for OLED display
+#define I2C_SDA 13
+#define I2C_SCL 14
+#else
+#error "Camera model not selected"
+#endif
+
+/* Constant defines -------------------------------------------------------- */
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
+#define EI_CAMERA_FRAME_BYTE_SIZE 3
+// --- OLED Display Settings ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+/* Private variables ------------------------------------------------------- */
+static bool debug_nn = false;
+static bool is_initialised = false;
+// <<< CHANGE 1: Declare the buffer pointer globally instead of in the loop
+uint8_t *snapshot_buf = nullptr;
+
+static camera_config_t camera_config = {
+  .pin_pwdn = PWDN_GPIO_NUM,
+  .pin_reset = RESET_GPIO_NUM,
+  .pin_xclk = XCLK_GPIO_NUM,
+  .pin_sscb_sda = SIOD_GPIO_NUM,
+  .pin_sscb_scl = SIOC_GPIO_NUM,
+  .pin_d7 = Y9_GPIO_NUM,
+  .pin_d6 = Y8_GPIO_NUM,
+  .pin_d5 = Y7_GPIO_NUM,
+  .pin_d4 = Y6_GPIO_NUM,
+  .pin_d3 = Y5_GPIO_NUM,
+  .pin_d2 = Y4_GPIO_NUM,
+  .pin_d1 = Y3_GPIO_NUM,
+  .pin_d0 = Y2_GPIO_NUM,
+  .pin_vsync = VSYNC_GPIO_NUM,
+  .pin_href = HREF_GPIO_NUM,
+  .pin_pclk = PCLK_GPIO_NUM,
+  .xclk_freq_hz = 20000000,
+  .ledc_timer = LEDC_TIMER_0,
+  .ledc_channel = LEDC_CHANNEL_0,
+  .pixel_format = PIXFORMAT_JPEG,
+  .frame_size = FRAMESIZE_QVGA,
+  .jpeg_quality = 12,
+  .fb_count = 2,
+  .fb_location = CAMERA_FB_IN_PSRAM,
+  .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+/* Function prototypes ---------------------------------------------------- */
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
+void startCameraServer();
+void handle_jpg_stream(void);
+void handle_jpg(void);
+void handleNotFound();
+void update_display(const char* label, float value, int dsp_time, int class_time);
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/**
+* @brief      Arduino setup function
+*/
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  Serial.println("Edge Impulse and Web-Stream Demo");
+
+  // Initialize I2C and OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("OLED Init OK"));
+  display.display();
+  delay(1000);
+
+  // Initialize the camera
+  if (ei_camera_init() == false) {
+    ei_printf("Failed to initialize Camera!\r\n");
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("Camera Init Failed!");
+    display.display();
+    return;
+  }
+  ei_printf("Camera initialized\r\n");
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Camera Init OK");
+  display.display();
+  delay(1000);
+
+  // <<< CHANGE 2: Allocate the buffer ONCE in setup
+  snapshot_buf = (uint8_t *)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+  if(snapshot_buf == nullptr) {
+      ei_printf("ERR: Failed to allocate snapshot buffer!\n");
+      // Handle memory allocation failure
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.println("Buffer Alloc Failed!");
+      display.display();
+      return;
+  }
+
+  // Connect to Wi-Fi
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Connecting to WiFi...");
+  display.display();
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("WiFi Connected!");
+  display.println(WiFi.localIP());
+  display.display();
+
+  // Start streaming web server
+  startCameraServer();
+  Serial.print("Camera Stream Ready! Go to: http://");
+  Serial.println(WiFi.localIP());
+
+  ei_printf("\nStarting continuous inference...\n");
+  delay(2000);
+}
+
+/**
+* @brief      Get data and run inferencing
+*/
+void loop() {
+  server.handleClient(); // Handle web server requests
+
+  // Ensure snapshot buffer is allocated
+  if (!snapshot_buf) {
+    ei_printf("Snapshot buffer not allocated. Halting.\n");
+    delay(1000);
+    return;
+  }
+
+  ei::signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.get_data = &ei_camera_get_data;
+
+  if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+    ei_printf("Failed to capture image for inference\r\n");
+    return;
+  }
+
+  ei_impulse_result_t result = { 0 };
+  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+  if (err != EI_IMPULSE_OK) {
+    ei_printf("ERR: Failed to run classifier (%d)\n", err);
+    return;
+  }
+  
+  // print the predictions to Serial
+  ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+            result.timing.dsp, result.timing.classification, result.timing.anomaly);
+
+  float max_value = 0;
+  int max_idx = -1;
+
+  // Print and find top prediction
+  for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    ei_printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
+    if (result.classification[i].value > max_value) {
+        max_value = result.classification[i].value;
+        max_idx = i;
+    }
+  }
+
+  // <<< CHANGE 3: Update the OLED with the top result
+  if (max_idx != -1) {
+    update_display(ei_classifier_inferencing_categories[max_idx], max_value, result.timing.dsp, result.timing.classification);
+  }
+  
+  // NOTE: We do NOT free the snapshot_buf here anymore. It's reused.
+  // A small delay to yield to other tasks, like the webserver
+  delay(1); 
+}
+
+// <<< CHANGE 4: New function to update the display
+/**
+ * @brief      Updates the OLED display with the latest inference results
+ * @param[in]  label       The top predicted label
+ * @param[in]  value       The confidence score for the top label
+ * @param[in]  dsp_time    DSP processing time
+ * @param[in]  class_time  Classification time
+ */
+void update_display(const char* label, float value, int dsp_time, int class_time) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.printf("%s\n", label); // Print the top label
+    
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.printf("Conf: %.2f\n", value); // Print confidence score
+    
+    display.setCursor(0, 32);
+    display.printf("IP: %s", WiFi.localIP().toString().c_str());
+
+    display.setCursor(0, 48);
+    display.printf("Timing: %d+%dms", dsp_time, class_time);
+
+    display.display();
+}
+
+
+//
+// All other functions (ei_camera_init, ei_camera_capture, web server handlers, etc.)
+// remain the same as in your original code. I am including them here for completeness.
+//
+
+// =================================================================
+// ===           EDGE IMPULSE CAMERA FUNCTIONS                   ===
+// =================================================================
+bool ei_camera_init(void) {
+  if (is_initialised) return true;
+  esp_err_t err = esp_camera_init(&camera_config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
+  }
+  sensor_t *s = esp_camera_sensor_get();
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, 0);
+  }
+  is_initialised = true;
+  return true;
+}
+
+void ei_camera_deinit(void) {
+  esp_err_t err = esp_camera_deinit();
+  if (err != ESP_OK) {
+    ei_printf("Camera deinit failed\n");
+    return;
+  }
+  is_initialised = false;
+}
+
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+  if (!is_initialised) {
+    ei_printf("ERR: Camera is not initialized\r\n");
+    return false;
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    ei_printf("Camera capture failed\n");
+    return false;
+  }
+  bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+  esp_camera_fb_return(fb);
+  if (!converted) {
+    ei_printf("Conversion failed\n");
+    return false;
+  }
+  if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+    ei::image::processing::crop_and_interpolate_rgb888(
+      out_buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+      out_buf, img_width, img_height);
+  }
+  return true;
+}
+
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+  size_t pixel_ix = offset * 3;
+  size_t pixels_left = length;
+  size_t out_ptr_ix = 0;
+  while (pixels_left != 0) {
+    out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) | (snapshot_buf[pixel_ix + 1] << 8) | snapshot_buf[pixel_ix];
+    out_ptr_ix++;
+    pixel_ix += 3;
+    pixels_left--;
+  }
+  return 0;
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "Invalid model for current sensor"
+#endif
+
+// =================================================================
+// ===               WEB SERVER FUNCTIONS                        ===
+// =================================================================
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+void startCameraServer() {
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html",
+                  "<html><head><title>ESP32-CAM Stream</title></head>"
+                  "<body><h1>ESP32-CAM Stream</h1>"
+                  "<p>Edge Impulse inference is running in the background. Check Serial Monitor for results.</p>"
+                  "<img src=\"/stream\">"
+                  "</body></html>");
+  });
+  server.on("/stream", HTTP_GET, handle_jpg_stream);
+  server.on("/capture", HTTP_GET, handle_jpg);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+void handle_jpg_stream(void) {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: " + String(_STREAM_CONTENT_TYPE) + "\r\n";
+  response += "Connection: close\r\n\r\n";
+  server.sendContent(response);
+  while (1) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      return;
+    }
+    if (client.connected()) {
+      response = _STREAM_BOUNDARY;
+      response += "Content-Type: image/jpeg\r\n";
+      response += "Content-Length: " + String(fb->len) + "\r\n\r\n";
+      server.sendContent(response);
+      client.write(fb->buf, fb->len);
+      server.sendContent("\r\n");
+    }
+    esp_camera_fb_return(fb);
+    if (!client.connected()) {
+      break;
+    }
+  }
+}
+
+void handle_jpg(void) {
+  WiFiClient client = server.client();
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Failed to capture image");
+    return;
+  }
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
+}
