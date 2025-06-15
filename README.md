@@ -28,4 +28,4 @@ Steps/approach
     7. Use the Adafruit example for OLED display, and try to display "HELLO WORLD".
     8. Now modify the base code to add the CameraWebServer and OLED display code to implement the project
     9. Implement FreeRTOS. Use the dual core capability of esp32 cam.
-   10. Core 0 - loop() for webstreaming. Core 1 - ML 
+   10. Core 1 - loop() for webstreaming. Core 0 - ML 
