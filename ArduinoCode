@@ -2,7 +2,7 @@
  * Copyright (c) 2022 EdgeImpulse Inc.
  *
  * This file is a combination of the Edge Impulse inferencing example
- * and the standard Arduino ESP32 CameraWebServer example.
+ * and the standard Arduino ESP32 CameraWebServer example, now with FreeRTOS.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -72,7 +72,6 @@ WebServer server(80);
 #define VSYNC_GPIO_NUM 25
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
-// <<< I2C pins for OLED display
 #define I2C_SDA 13
 #define I2C_SCL 14
 #else
@@ -83,70 +82,43 @@ WebServer server(80);
 #define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
 #define EI_CAMERA_FRAME_BYTE_SIZE 3
-// --- OLED Display Settings ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
 /* Private variables ------------------------------------------------------- */
 static bool debug_nn = false;
 static bool is_initialised = false;
-// <<< CHANGE 1: Declare the buffer pointer globally instead of in the loop
 uint8_t *snapshot_buf = nullptr;
 
 static camera_config_t camera_config = {
-  .pin_pwdn = PWDN_GPIO_NUM,
-  .pin_reset = RESET_GPIO_NUM,
-  .pin_xclk = XCLK_GPIO_NUM,
-  .pin_sscb_sda = SIOD_GPIO_NUM,
-  .pin_sscb_scl = SIOC_GPIO_NUM,
-  .pin_d7 = Y9_GPIO_NUM,
-  .pin_d6 = Y8_GPIO_NUM,
-  .pin_d5 = Y7_GPIO_NUM,
-  .pin_d4 = Y6_GPIO_NUM,
-  .pin_d3 = Y5_GPIO_NUM,
-  .pin_d2 = Y4_GPIO_NUM,
-  .pin_d1 = Y3_GPIO_NUM,
-  .pin_d0 = Y2_GPIO_NUM,
-  .pin_vsync = VSYNC_GPIO_NUM,
-  .pin_href = HREF_GPIO_NUM,
-  .pin_pclk = PCLK_GPIO_NUM,
-  .xclk_freq_hz = 20000000,
-  .ledc_timer = LEDC_TIMER_0,
-  .ledc_channel = LEDC_CHANNEL_0,
-  .pixel_format = PIXFORMAT_JPEG,
-  .frame_size = FRAMESIZE_QVGA,
-  .jpeg_quality = 12,
-  .fb_count = 2,
-  .fb_location = CAMERA_FB_IN_PSRAM,
-  .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+  .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
+  .pin_sscb_sda = SIOD_GPIO_NUM, .pin_sscb_scl = SIOC_GPIO_NUM, .pin_d7 = Y9_GPIO_NUM,
+  .pin_d6 = Y8_GPIO_NUM, .pin_d5 = Y7_GPIO_NUM, .pin_d4 = Y6_GPIO_NUM, .pin_d3 = Y5_GPIO_NUM,
+  .pin_d2 = Y4_GPIO_NUM, .pin_d1 = Y3_GPIO_NUM, .pin_d0 = Y2_GPIO_NUM, .pin_vsync = VSYNC_GPIO_NUM,
+  .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM, .xclk_freq_hz = 20000000,
+  .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0, .pixel_format = PIXFORMAT_JPEG,
+  .frame_size = FRAMESIZE_QVGA, .jpeg_quality = 12, .fb_count = 2,
+  .fb_location = CAMERA_FB_IN_PSRAM, .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
 /* Function prototypes ---------------------------------------------------- */
-bool ei_camera_init(void);
-void ei_camera_deinit(void);
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
-static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
-void startCameraServer();
-void handle_jpg_stream(void);
-void handle_jpg(void);
-void handleNotFound();
-void update_display(const char* label, float value, int dsp_time, int class_time);
+// ... (Your other function prototypes are fine)
+void inferenceTask(void *pvParameters); // <<< Prototype for our new task
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 /**
-* @brief      Arduino setup function
+* @brief      Arduino setup function - runs on Core 1
 */
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
   Serial.begin(115200);
-  Serial.println("Edge Impulse and Web-Stream Demo");
+  Serial.println("Edge Impulse, Web-Stream, and FreeRTOS Demo");
 
   // Initialize I2C and OLED
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
+    Serial.println(F("SSD1306 allocation failed")); for (;;);
   }
   display.clearDisplay();
   display.setTextSize(1);
@@ -159,129 +131,127 @@ void setup() {
   // Initialize the camera
   if (ei_camera_init() == false) {
     ei_printf("Failed to initialize Camera!\r\n");
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.println("Camera Init Failed!");
-    display.display();
-    return;
+    display.clearDisplay(); display.setCursor(0,0); display.println("Camera Init Failed!");
+    display.display(); return;
   }
   ei_printf("Camera initialized\r\n");
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Camera Init OK");
-  display.display();
-  delay(1000);
+  display.clearDisplay(); display.setCursor(0,0); display.println("Camera Init OK");
+  display.display(); delay(1000);
 
-  // <<< CHANGE 2: Allocate the buffer ONCE in setup
+  // Allocate the buffer ONCE
   snapshot_buf = (uint8_t *)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
   if(snapshot_buf == nullptr) {
       ei_printf("ERR: Failed to allocate snapshot buffer!\n");
-      // Handle memory allocation failure
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Buffer Alloc Failed!");
-      display.display();
-      return;
+      display.clearDisplay(); display.setCursor(0,0); display.println("Buffer Alloc Failed!");
+      display.display(); return;
   }
 
   // Connect to Wi-Fi
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Connecting to WiFi...");
+  display.clearDisplay(); display.setCursor(0,0); display.println("Connecting to WiFi...");
   display.display();
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println("\nWiFi connected");
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("WiFi Connected!");
-  display.println(WiFi.localIP());
-  display.display();
+  display.clearDisplay(); display.setCursor(0,0); display.println("WiFi Connected!");
+  display.println(WiFi.localIP()); display.display();
 
   // Start streaming web server
   startCameraServer();
-  Serial.print("Camera Stream Ready! Go to: http://");
-  Serial.println(WiFi.localIP());
+  Serial.print("Camera Stream Ready! Go to: http://"); Serial.println(WiFi.localIP());
 
-  ei_printf("\nStarting continuous inference...\n");
-  delay(2000);
+  ei_printf("\nStarting inference task on Core 0...\n");
+
+  // <<< CREATE THE INFERENCE TASK ON CORE 0
+  xTaskCreatePinnedToCore(
+      inferenceTask,   // Function to implement the task
+      "InferenceTask", // Name of the task
+      8192,            // Stack size in words (8192 is a safe size for ML)
+      NULL,            // Task input parameter
+      1,               // Priority of the task
+      NULL,            // Task handle
+      0                // Core where the task should run (0)
+  );
 }
 
+// <<< NEW - THE MAIN LOOP ONLY HANDLES THE WEB SERVER
 /**
-* @brief      Get data and run inferencing
-*/
+ * @brief      Arduino loop function - runs on Core 1
+ */
 void loop() {
-  server.handleClient(); // Handle web server requests
-
-  // Ensure snapshot buffer is allocated
-  if (!snapshot_buf) {
-    ei_printf("Snapshot buffer not allocated. Halting.\n");
-    delay(1000);
-    return;
-  }
-
-  ei::signal_t signal;
-  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-  signal.get_data = &ei_camera_get_data;
-
-  if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
-    ei_printf("Failed to capture image for inference\r\n");
-    return;
-  }
-
-  ei_impulse_result_t result = { 0 };
-  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
-  if (err != EI_IMPULSE_OK) {
-    ei_printf("ERR: Failed to run classifier (%d)\n", err);
-    return;
-  }
-  
-  // print the predictions to Serial
-  ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-            result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-  float max_value = 0;
-  int max_idx = -1;
-
-  // Print and find top prediction
-  for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    ei_printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
-    if (result.classification[i].value > max_value) {
-        max_value = result.classification[i].value;
-        max_idx = i;
-    }
-  }
-
-  // <<< CHANGE 3: Update the OLED with the top result
-  if (max_idx != -1) {
-    update_display(ei_classifier_inferencing_categories[max_idx], max_value, result.timing.dsp, result.timing.classification);
-  }
-  
-  // NOTE: We do NOT free the snapshot_buf here anymore. It's reused.
-  // A small delay to yield to other tasks, like the webserver
-  delay(1); 
+  server.handleClient(); // Keep the web server responsive
+  delay(10);             // Small delay to yield to other tasks on this core
 }
 
-// <<< CHANGE 4: New function to update the display
+// <<< NEW - THIS TASK RUNS THE ENTIRE ML WORKFLOW ON CORE 0
+/**
+ * @brief      Task to run machine learning inference continuously
+ */
+void inferenceTask(void *pvParameters) {
+  // This is an infinite loop that will run on Core 0
+  for (;;) {
+    // Ensure snapshot buffer is allocated
+    if (!snapshot_buf) {
+      ei_printf("Snapshot buffer not allocated. Halting task.\n");
+      delay(1000);
+      continue; // Skip to next iteration
+    }
+
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+
+    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+      ei_printf("Failed to capture image for inference\r\n");
+      delay(100); // Wait a bit before retrying
+      continue;
+    }
+
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    if (err != EI_IMPULSE_OK) {
+      ei_printf("ERR: Failed to run classifier (%d)\n", err);
+      delay(100);
+      continue;
+    }
+    
+    // Print the predictions to Serial
+    ei_printf("Predictions (DSP: %d ms., Cla: %d ms.): \n",
+              result.timing.dsp, result.timing.classification);
+
+    float max_value = 0;
+    int max_idx = -1;
+
+    // Print and find top prediction
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+      ei_printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
+      if (result.classification[i].value > max_value) {
+          max_value = result.classification[i].value;
+          max_idx = i;
+      }
+    }
+
+    // Update the OLED with the top result
+    if (max_idx != -1) {
+      update_display(ei_classifier_inferencing_categories[max_idx], max_value, result.timing.dsp, result.timing.classification);
+    }
+    
+    // Small delay to control the frame rate of inference and not hog Core 0
+    delay(100); 
+  }
+}
+
 /**
  * @brief      Updates the OLED display with the latest inference results
- * @param[in]  label       The top predicted label
- * @param[in]  value       The confidence score for the top label
- * @param[in]  dsp_time    DSP processing time
- * @param[in]  class_time  Classification time
  */
 void update_display(const char* label, float value, int dsp_time, int class_time) {
     display.clearDisplay();
     display.setTextSize(2);
     display.setCursor(0, 0);
-    display.printf("%s\n", label); // Print the top label
+    display.printf("%s\n", label);
     
     display.setTextSize(1);
     display.setCursor(0, 20);
-    display.printf("Conf: %.2f\n", value); // Print confidence score
+    display.printf("Conf: %.2f\n", value);
     
     display.setCursor(0, 32);
     display.printf("IP: %s", WiFi.localIP().toString().c_str());
@@ -292,12 +262,10 @@ void update_display(const char* label, float value, int dsp_time, int class_time
     display.display();
 }
 
-
-//
-// All other functions (ei_camera_init, ei_camera_capture, web server handlers, etc.)
-// remain the same as in your original code. I am including them here for completeness.
-//
-
+// =================================================================
+// ===           ALL OTHER FUNCTIONS REMAIN THE SAME             ===
+// =================================================================
+// ... (ei_camera_init, ei_camera_capture, web server handlers, etc. all stay exactly as they were) ...
 // =================================================================
 // ===           EDGE IMPULSE CAMERA FUNCTIONS                   ===
 // =================================================================
