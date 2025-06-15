@@ -1,40 +1,38 @@
-/* Edge Impulse Arduino examples
- * Copyright (c) 2022 EdgeImpulse Inc.
+/**
+ * @file esp32_cam_ml_freertos.ino
+ * @author Your Name
+ * @brief ESP32-CAM Project with Machine Learning, Web Stream, and OLED Display.
+ * @version 3.0
+ * @date 2023-10-27
  *
- * This file is a combination of the Edge Impulse inferencing example
- * and the standard Arduino ESP32 CameraWebServer example.
+ * @details This project demonstrates a robust implementation for the ESP32-CAM.
+ * It uses the FreeRTOS (Real-Time Operating System) to run two main processes on
+ * the ESP32's dual cores for maximum stability and performance:
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * - CORE 1: Runs the standard Arduino `loop()`. Its only job is to handle the
+ *           web server, ensuring the video stream is always smooth and responsive.
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
+ * - CORE 0: Runs a dedicated "task" for all the heavy machine learning work.
+ *           This includes capturing images, running the Edge Impulse model, and
+ *           updating the OLED display with the results.
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * This separation prevents the long-running ML model from freezing the web server,
+ * which is a common problem in simpler implementations.
  */
 
-// These sketches are tested with 2.0.4 ESP32 Arduino Core
-// https://github.com/espressif/arduino-esp32/releases/tag/2.0.4
-
-/* Includes ---------------------------------------------------------------- */
-// Edge Impulse
+// =================================================================
+// ===                        INCLUDES                           ===
+// =================================================================
+// --- Edge Impulse Machine Learning Library ---
 #include <Prasadh-project-1_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
+
+// --- OLED Display Libraries ---
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ESP32 Camera and Web Server
+// --- ESP32 Hardware & Web Server Libraries ---
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "esp_timer.h"
@@ -45,13 +43,20 @@
 #include "driver/rtc_io.h"
 #include <WebServer.h>
 
-// Replace with your network credentials
+// =================================================================
+// ===                 CONFIGURATION & DEFINES                   ===
+// =================================================================
+
+// --- IMPORTANT: ENTER YOUR WIFI DETAILS HERE ---
 const char *ssid = "ACT-B631";
 const char *password = "qwertyuiop";
 
+// --- Web Server Object ---
 WebServer server(80);
 
-// Select camera model - AI THINKER
+// --- Camera Model Definition ---
+// This section sets up the correct hardware pins for the AI-Thinker model.
+// If you use a different ESP32-CAM model, you would change it here.
 #define CAMERA_MODEL_AI_THINKER
 
 #if defined(CAMERA_MODEL_AI_THINKER)
@@ -72,100 +77,68 @@ WebServer server(80);
 #define VSYNC_GPIO_NUM 25
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
-// <<< I2C pins for OLED display
+// Define the pins for the I2C connection to the OLED screen
 #define I2C_SDA 13
 #define I2C_SCL 14
 #else
 #error "Camera model not selected"
 #endif
 
-/* Constant defines -------------------------------------------------------- */
-#define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
-#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
-#define EI_CAMERA_FRAME_BYTE_SIZE 3
-// --- OLED Display Settings ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+// --- Constants ---
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320 // Width of the captured image
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240 // Height of the captured image
+#define EI_CAMERA_FRAME_BYTE_SIZE 3         // 3 bytes per pixel (R, G, B)
+#define SCREEN_WIDTH 128                    // OLED display width, in pixels
+#define SCREEN_HEIGHT 64                    // OLED display height, in pixels
 
-/* Private variables ------------------------------------------------------- */
-static bool debug_nn = false;
-static bool is_initialised = false;
-// <<< CHANGE 1: Declare the buffer pointer globally instead of in the loop
-uint8_t *snapshot_buf = nullptr;
+// --- Global Variables ---
+static bool debug_nn = false;       // Set to true for more ML model debug info
+static bool is_initialised = false; // Flag to check if camera has started
+uint8_t *snapshot_buf = nullptr;    // Pointer to the memory where the image will be stored
 
+// This struct holds all the settings for the camera hardware.
 static camera_config_t camera_config = {
-  .pin_pwdn = PWDN_GPIO_NUM,
-  .pin_reset = RESET_GPIO_NUM,
-  .pin_xclk = XCLK_GPIO_NUM,
-  .pin_sscb_sda = SIOD_GPIO_NUM,
-  .pin_sscb_scl = SIOC_GPIO_NUM,
-  .pin_d7 = Y9_GPIO_NUM,
-  .pin_d6 = Y8_GPIO_NUM,
-  .pin_d5 = Y7_GPIO_NUM,
-  .pin_d4 = Y6_GPIO_NUM,
-  .pin_d3 = Y5_GPIO_NUM,
-  .pin_d2 = Y4_GPIO_NUM,
-  .pin_d1 = Y3_GPIO_NUM,
-  .pin_d0 = Y2_GPIO_NUM,
-  .pin_vsync = VSYNC_GPIO_NUM,
-  .pin_href = HREF_GPIO_NUM,
-  .pin_pclk = PCLK_GPIO_NUM,
-  .xclk_freq_hz = 20000000,
-  .ledc_timer = LEDC_TIMER_0,
-  .ledc_channel = LEDC_CHANNEL_0,
-  .pixel_format = PIXFORMAT_JPEG,
-  .frame_size = FRAMESIZE_QVGA,
-  .jpeg_quality = 12,
+  .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
+  .pin_sscb_sda = SIOD_GPIO_NUM, .pin_sscb_scl = SIOC_GPIO_NUM, .pin_d7 = Y9_GPIO_NUM,
+  .pin_d6 = Y8_GPIO_NUM, .pin_d5 = Y7_GPIO_NUM, .pin_d4 = Y6_GPIO_NUM, .pin_d3 = Y5_GPIO_NUM,
+  .pin_d2 = Y4_GPIO_NUM, .pin_d1 = Y3_GPIO_NUM, .pin_d0 = Y2_GPIO_NUM, .pin_vsync = VSYNC_GPIO_NUM,
+  .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM, .xclk_freq_hz = 20000000,
+  .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0, .pixel_format = PIXFORMAT_JPEG,
+  .frame_size = FRAMESIZE_QVGA, .jpeg_quality = 12,
+  // Use 2 frame buffers. This is crucial for allowing the web stream and the inference code
+  // to access the camera without conflicts. One can be used for streaming while the other is used for ML.
   .fb_count = 2,
-  .fb_location = CAMERA_FB_IN_PSRAM,
-  .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+  .fb_location = CAMERA_FB_IN_PSRAM, .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
-/* Function prototypes ---------------------------------------------------- */
-bool ei_camera_init(void);
-void ei_camera_deinit(void);
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
-static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
-void startCameraServer();
-void handle_jpg_stream(void);
-void handle_jpg(void);
-void handleNotFound();
-void update_display(const char* label, float value, int dsp_time, int class_time);
+// --- Function Prototypes ---
+// Declaring our functions here so the compiler knows they exist.
+void inferenceTask(void *pvParameters); // The function for our machine learning task.
 
+// Create an object to represent our OLED display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
+
+// =================================================================
+// ===                SETUP (Runs ONCE on Core 1)                ===
+// =================================================================
 /**
-* @brief      Arduino setup function
-*/
-
-#include "soc/rtc_cntl_reg.h"
-#include "soc/soc.h"
-
+ * @brief The standard Arduino setup function. It runs ONCE at startup on Core 1.
+ *        Its job is to initialize all the hardware and create the inference task for Core 0.
+ */
 void setup() {
+  // Disables a safety feature that can cause reboots with unstable power.
+  // A good power supply is still essential!
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-  // <<< ADD THESE LINES TO DISABLE THE WATCHDOG
-  // This is a debugging step, not a final solution!
-  //disableCore0WDT();
-  //disableCore1WDT();
+  // Start serial communication with the computer for debugging.
+  Serial.begin(115200);
+  Serial.println("Edge Impulse, Web-Stream, and FreeRTOS Demo");
 
-  // The rest of your setup code...
- //WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  //Serial.begin(115200);
-  //...
-
-  //WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  //Serial.begin(115200);
-
-  //...
-
-  
-  Serial.println("Edge Impulse and Web-Stream Demo");
-
-  // Initialize I2C and OLED
-  Wire.begin(I2C_SDA, I2C_SCL);
+  // --- Initialize OLED Display ---
+  Wire.begin(I2C_SDA, I2C_SCL); // Start I2C communication on our custom pins
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
+    Serial.println(F("SSD1306 allocation failed")); for (;;); // Stop if display fails
   }
   display.clearDisplay();
   display.setTextSize(1);
@@ -175,132 +148,155 @@ void setup() {
   display.display();
   delay(1000);
 
-  // Initialize the camera
+  // --- Initialize Camera ---
   if (ei_camera_init() == false) {
-    ei_printf("Failed to initialize Camera!\r\n");
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.println("Camera Init Failed!");
-    display.display();
-    return;
+    Serial.println("Failed to initialize Camera!");
+    // Update display and stop
+    display.clearDisplay(); display.setCursor(0,0); display.println("Camera Init Failed!");
+    display.display(); return;
   }
-  ei_printf("Camera initialized\r\n");
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Camera Init OK");
-  display.display();
-  delay(1000);
+  Serial.println("Camera initialized");
+  display.clearDisplay(); display.setCursor(0,0); display.println("Camera Init OK");
+  display.display(); delay(1000);
 
-  // <<< CHANGE 2: Allocate the buffer ONCE in setup
+  // --- Allocate Memory for Image Buffer ---
+  // Allocate a large piece of memory for the camera image.
+  // We do this ONCE in setup() to be efficient and prevent memory issues in the loop.
   snapshot_buf = (uint8_t *)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
   if(snapshot_buf == nullptr) {
-      ei_printf("ERR: Failed to allocate snapshot buffer!\n");
-      // Handle memory allocation failure
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Buffer Alloc Failed!");
-      display.display();
-      return;
+      Serial.println("ERR: Failed to allocate snapshot buffer!");
+      display.clearDisplay(); display.setCursor(0,0); display.println("Buffer Alloc Failed!");
+      display.display(); return;
   }
 
-  // Connect to Wi-Fi
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Connecting to WiFi...");
+  // --- Connect to WiFi ---
+  display.clearDisplay(); display.setCursor(0,0); display.println("Connecting to WiFi...");
   display.display();
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println("\nWiFi connected");
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("WiFi Connected!");
-  display.println(WiFi.localIP());
-  display.display();
+  display.clearDisplay(); display.setCursor(0,0); display.println("WiFi Connected!");
+  display.println(WiFi.localIP()); display.display();
 
-  // Start streaming web server
+  // --- Start Web Server ---
   startCameraServer();
-  Serial.print("Camera Stream Ready! Go to: http://");
-  Serial.println(WiFi.localIP());
+  Serial.print("Camera Stream Ready! Go to: http://"); Serial.println(WiFi.localIP());
 
-  ei_printf("\nStarting continuous inference...\n");
-  delay(2000);
+  Serial.println("\nStarting inference task on Core 0...");
+
+  // --- Create the Machine Learning Task ---
+  // This is the core of the FreeRTOS implementation. We are creating a separate,
+  // independent 'program' (called a task) that will run our machine learning code.
+  // We 'pin' this task to Core 0. The ESP32 has two cores. By doing this, our ML
+  // code runs on one core, and the main Arduino loop (with the web server) runs on
+  // the other (Core 1). This prevents them from slowing each other down.
+  xTaskCreatePinnedToCore(
+      inferenceTask,   // The function that contains the code for this task
+      "InferenceTask", // A name for the task (useful for debugging)
+      8192,            // The amount of memory to give this task (8192 words is a safe size for ML)
+      NULL,            // We are not passing any input parameters to the task
+      1,               // The priority of the task (1 is a good default)
+      NULL,            // We don't need to keep track of the task handle
+      0                // The core to run this task on: 0. (Core 1 is for the Arduino loop)
+  );
 }
 
+// =================================================================
+// ===         MAIN LOOP (Runs FOREVER on Core 1)                ===
+// =================================================================
 /**
-* @brief      Get data and run inferencing
-*/
+ * @brief The standard Arduino loop function, running on Core 1.
+ *        Because all the heavy ML work is now on Core 0, this loop's ONLY job is
+ *        to handle web server requests. This makes the video stream very responsive.
+ */
 void loop() {
-  server.handleClient(); // Handle web server requests
-
-  // Ensure snapshot buffer is allocated
-  if (!snapshot_buf) {
-    ei_printf("Snapshot buffer not allocated. Halting.\n");
-    delay(1000);
-    return;
-  }
-
-  ei::signal_t signal;
-  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-  signal.get_data = &ei_camera_get_data;
-
-  if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
-    ei_printf("Failed to capture image for inference\r\n");
-    return;
-  }
-
-  delay(1); 
-
-  ei_impulse_result_t result = { 0 };
-  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
-  if (err != EI_IMPULSE_OK) {
-    ei_printf("ERR: Failed to run classifier (%d)\n", err);
-    return;
-  }
-  
-  // print the predictions to Serial
-  ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-            result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-  float max_value = 0;
-  int max_idx = -1;
-
-  // Print and find top prediction
-  for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    ei_printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
-    if (result.classification[i].value > max_value) {
-        max_value = result.classification[i].value;
-        max_idx = i;
-    }
-  }
-
-  // <<< CHANGE 3: Update the OLED with the top result
-  if (max_idx != -1) {
-    update_display(ei_classifier_inferencing_categories[max_idx], max_value, result.timing.dsp, result.timing.classification);
-  }
-  
-  // NOTE: We do NOT free the snapshot_buf here anymore. It's reused.
-  // A small delay to yield to other tasks, like the webserver
-  delay(1); 
+  // Check if a web browser is asking for a new video frame or the webpage.
+  server.handleClient();
+  // A small delay to be friendly to the system and prevent this loop from running unnecessarily fast.
+  delay(10);
 }
 
-// <<< CHANGE 4: New function to update the display
+
+// =================================================================
+// ===      INFERENCE TASK (Runs FOREVER on Core 0)              ===
+// =================================================================
 /**
- * @brief      Updates the OLED display with the latest inference results
- * @param[in]  label       The top predicted label
- * @param[in]  value       The confidence score for the top label
- * @param[in]  dsp_time    DSP processing time
- * @param[in]  class_time  Classification time
+ * @brief This task contains all the code that was previously in `loop()`.
+ *        It runs in an infinite loop completely independently on Core 0.
+ */
+void inferenceTask(void *pvParameters) {
+  // This is an infinite loop that will run on Core 0 for the device's entire uptime.
+  for (;;) {
+    // --- 1. Take a Picture ---
+    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+      Serial.println("Failed to capture image for inference");
+      delay(100); // Wait a bit before retrying
+      continue;   // Go to the start of the next loop iteration
+    }
+
+    // --- 2. Run the Machine Learning Model ---
+    // Prepare the image data for the model
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+
+    // Run the classifier on the image data
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    if (err != EI_IMPULSE_OK) {
+      Serial.printf("ERR: Failed to run classifier (%d)\n", err);
+      delay(100);
+      continue;
+    }
+    
+    // --- 3. Process the Results ---
+    // Print timing information to the Serial Monitor
+    Serial.printf("Predictions (DSP: %d ms., Classification: %d ms.): \n",
+              result.timing.dsp, result.timing.classification);
+
+    float max_value = 0;
+    int max_idx = -1;
+
+    // Loop through all the possible classes (e.g., "cat", "dog", "unknown")
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+      // Print the score for each class
+      Serial.printf("  %s: %.5f\r\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
+      // Keep track of which class had the highest score
+      if (result.classification[i].value > max_value) {
+          max_value = result.classification[i].value;
+          max_idx = i;
+      }
+    }
+
+    // --- 4. Show the Top Result on the OLED screen ---
+    if (max_idx != -1) {
+      update_display(ei_classifier_inferencing_categories[max_idx], max_value, result.timing.dsp, result.timing.classification);
+    }
+    
+    // --- 5. Wait for a Moment ---
+    // This delay controls how many times per second we run inference.
+    // It also prevents this task from using 100% of Core 0's processing power.
+    delay(100);
+  }
+}
+
+// =================================================================
+// ===                  HELPER FUNCTIONS                         ===
+// =================================================================
+/**
+ * @brief      Updates the OLED display with the latest inference results.
+ * @param[in]  label       The top predicted label (e.g., "cat")
+ * @param[in]  value       The confidence score for that label (e.g., 0.95)
+ * @param[in]  dsp_time    The time it took for the DSP part of the model
+ * @param[in]  class_time  The time it took for the classification part
  */
 void update_display(const char* label, float value, int dsp_time, int class_time) {
-    display.clearDisplay();
-    display.setTextSize(2);
+    display.clearDisplay(); // Clear previous content
+    display.setTextSize(2); // Use a large font for the label
     display.setCursor(0, 0);
     display.printf("%s\n", label); // Print the top label
     
-    display.setTextSize(1);
+    display.setTextSize(1); // Use a smaller font for the details
     display.setCursor(0, 20);
     display.printf("Conf: %.2f\n", value); // Print confidence score
     
@@ -310,64 +306,34 @@ void update_display(const char* label, float value, int dsp_time, int class_time
     display.setCursor(0, 48);
     display.printf("Timing: %d+%dms", dsp_time, class_time);
 
-    display.display();
+    display.display(); // Send the new content to the screen
 }
 
-
-//
-// All other functions (ei_camera_init, ei_camera_capture, web server handlers, etc.)
-// remain the same as in your original code. I am including them here for completeness.
-//
-
 // =================================================================
-// ===           EDGE IMPULSE CAMERA FUNCTIONS                   ===
+// ===     LOW-LEVEL CAMERA AND WEB SERVER FUNCTIONS             ===
+// === (These are standard library functions, usually no need to edit) ===
 // =================================================================
+
+// --- Camera Functions ---
 bool ei_camera_init(void) {
   if (is_initialised) return true;
   esp_err_t err = esp_camera_init(&camera_config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return false;
-  }
+  if (err != ESP_OK) { Serial.printf("Camera init failed with error 0x%x\n", err); return false; }
   sensor_t *s = esp_camera_sensor_get();
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);
-    s->set_brightness(s, 1);
-    s->set_saturation(s, 0);
-  }
+  if (s->id.PID == OV3660_PID) { s->set_vflip(s, 1); s->set_brightness(s, 1); s->set_saturation(s, 0); }
   is_initialised = true;
   return true;
 }
 
-void ei_camera_deinit(void) {
-  esp_err_t err = esp_camera_deinit();
-  if (err != ESP_OK) {
-    ei_printf("Camera deinit failed\n");
-    return;
-  }
-  is_initialised = false;
-}
-
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
-  if (!is_initialised) {
-    ei_printf("ERR: Camera is not initialized\r\n");
-    return false;
-  }
+  if (!is_initialised) { Serial.println("ERR: Camera is not initialized"); return false; }
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    ei_printf("Camera capture failed\n");
-    return false;
-  }
+  if (!fb) { Serial.println("Camera capture failed"); return false; }
   bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
   esp_camera_fb_return(fb);
-  if (!converted) {
-    ei_printf("Conversion failed\n");
-    return false;
-  }
+  if (!converted) { Serial.println("Conversion failed"); return false; }
   if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
-    ei::image::processing::crop_and_interpolate_rgb888(
-      out_buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
-      out_buf, img_width, img_height);
+    ei::image::processing::crop_and_interpolate_rgb888(out_buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS, out_buf, img_width, img_height);
   }
   return true;
 }
@@ -378,9 +344,7 @@ static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
   size_t out_ptr_ix = 0;
   while (pixels_left != 0) {
     out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) | (snapshot_buf[pixel_ix + 1] << 8) | snapshot_buf[pixel_ix];
-    out_ptr_ix++;
-    pixel_ix += 3;
-    pixels_left--;
+    out_ptr_ix++; pixel_ix += 3; pixels_left--;
   }
   return 0;
 }
@@ -389,9 +353,7 @@ static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
 #error "Invalid model for current sensor"
 #endif
 
-// =================================================================
-// ===               WEB SERVER FUNCTIONS                        ===
-// =================================================================
+// --- Web Server Functions ---
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
@@ -420,10 +382,7 @@ void handle_jpg_stream(void) {
   server.sendContent(response);
   while (1) {
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      return;
-    }
+    if (!fb) { Serial.println("Camera capture failed"); return; }
     if (client.connected()) {
       response = _STREAM_BOUNDARY;
       response += "Content-Type: image/jpeg\r\n";
@@ -433,20 +392,14 @@ void handle_jpg_stream(void) {
       server.sendContent("\r\n");
     }
     esp_camera_fb_return(fb);
-    if (!client.connected()) {
-      break;
-    }
+    if (!client.connected()) { break; }
   }
 }
 
 void handle_jpg(void) {
   WiFiClient client = server.client();
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    server.send(500, "text/plain", "Failed to capture image");
-    return;
-  }
+  if (!fb) { Serial.println("Camera capture failed"); server.send(500, "text/plain", "Failed to capture image"); return; }
   server.setContentLength(fb->len);
   server.send(200, "image/jpeg", "");
   client.write(fb->buf, fb->len);
